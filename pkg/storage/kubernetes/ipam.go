@@ -616,7 +616,8 @@ func retriableAllocateDeallocateFromRange(ctx context.Context, ipam *KubernetesI
 	pool, err := ipam.GetIPPool(ctx, poolIdentifier)
 	if err != nil {
 		err := fmt.Errorf("cannot read IPAM pool allocation: %w", err)
-		if e, ok := err.(storage.Temporary); ok && e.Temporary() {
+		var tmpErr storage.Temporary
+		if ok := goerr.As(err, &tmpErr); ok && tmpErr.Temporary() {
 			return net.IPNet{}, overlappingrangeallocations, skipOverlappingRangeUpdate, RetriableError{err}
 		}
 		return net.IPNet{}, overlappingrangeallocations, skipOverlappingRangeUpdate, err
@@ -682,7 +683,8 @@ func retriableAllocateDeallocateFromRange(ctx context.Context, ipam *KubernetesI
 	err = pool.Update(ctx, usereservelist)
 	if err != nil {
 		err = fmt.Errorf("cannot update IPAM pool allocations: %w", err)
-		if e, ok := err.(storage.Temporary); ok && e.Temporary() {
+		var tmpErr storage.Temporary
+		if ok := goerr.As(err, &tmpErr); ok && tmpErr.Temporary() {
 			return net.IPNet{}, overlappingrangeallocations, skipOverlappingRangeUpdate, RetriableError{fmt.Errorf("cannot update IPAM pool allocations: %w", err)}
 		}
 		return net.IPNet{}, overlappingrangeallocations, skipOverlappingRangeUpdate, err
