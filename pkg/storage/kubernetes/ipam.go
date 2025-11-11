@@ -542,17 +542,216 @@ func getNodeSliceName(ipam *KubernetesIPAM) string {
 	return ipam.Config.NetworkName
 }
 
+func getNodeSlicedRangeAndPoolConfiguration(ctx context.Context, ipam *KubernetesIPAM, ipRange whereaboutstypes.RangeConfiguration, poolIdentifier PoolIdentifier) (whereaboutstypes.RangeConfiguration, PoolIdentifier, error) {
+	hostname, err := getNodeName(ipam)
+	if err != nil {
+		return whereaboutstypes.RangeConfiguration{}, PoolIdentifier{}, fmt.Errorf("cannot get node hostname: %w", err)
+	}
+
+	poolIdentifier.NodeName = hostname
+
+	nodeSliceRange, err := GetNodeSlicePoolRange(ctx, ipam, hostname)
+	if err != nil {
+		return whereaboutstypes.RangeConfiguration{}, PoolIdentifier{}, fmt.Errorf("cannot get node slice range for %s node: %w", hostname, err)
+	}
+
+	_, ipNet, err := net.ParseCIDR(nodeSliceRange)
+	if err != nil {
+		return whereaboutstypes.RangeConfiguration{}, PoolIdentifier{}, fmt.Errorf("cannot parse node slice cidr to net.IPNet: %w", err)
+	}
+
+	poolIdentifier.IpRange = nodeSliceRange
+	pool := whereaboutstypes.Pool{
+		IPNet:                   *ipNet,
+		IncludeNetworkAddress:   ipRange.IncludeNetworkAddress,
+		IncludeBroadcastAddress: ipRange.IncludeBroadcastAddress,
+	}
+
+	rangeStart, err := iphelpers.FirstUsableIP(pool)
+	if err != nil {
+		return whereaboutstypes.RangeConfiguration{}, PoolIdentifier{}, fmt.Errorf("cannot parse node slice cidr to range start: %w", err)
+	}
+
+	rangeEnd, err := iphelpers.LastUsableIP(pool)
+	if err != nil {
+		return whereaboutstypes.RangeConfiguration{}, PoolIdentifier{}, fmt.Errorf("cannot parse node slice cidr to range end: %w", err)
+	}
+
+	ipRange = whereaboutstypes.RangeConfiguration{
+		Range: ipRange.Range,
+
+		RangeStart:            rangeStart,
+		IncludeNetworkAddress: ipRange.IncludeNetworkAddress,
+
+		RangeEnd:                rangeEnd,
+		IncludeBroadcastAddress: ipRange.IncludeBroadcastAddress,
+	}
+
+	return ipRange, poolIdentifier, nil
+}
+
+type RetriableError struct {
+	error
+}
+
+func retriableAllocateDeallocateFromRange(ctx context.Context, ipam *KubernetesIPAM, ipamConf whereaboutstypes.IPAMConfig, overlappingrangestore storage.OverlappingRangeStore, overlappingrangeallocations []whereaboutstypes.IPReservation, mode whereaboutstypes.OperationType, ipRange whereaboutstypes.RangeConfiguration) (net.IPNet, []whereaboutstypes.IPReservation, bool, error) {
+	var (
+		newip net.IPNet
+
+		skipOverlappingRangeUpdate bool
+
+		err error
+	)
+
+	poolIdentifier := PoolIdentifier{IpRange: ipRange.Range, NetworkName: ipamConf.NetworkName}
+	if ipamConf.NodeSliceSize != "" {
+		ipRange, poolIdentifier, err = getNodeSlicedRangeAndPoolConfiguration(ctx, ipam, ipRange, poolIdentifier)
+		if err != nil {
+			return net.IPNet{}, overlappingrangeallocations, skipOverlappingRangeUpdate, fmt.Errorf("cannot get node-sliced configuration: %w", err)
+		}
+	}
+
+	logging.Debugf("using pool identifier: %v", poolIdentifier)
+
+	pool, err := ipam.GetIPPool(ctx, poolIdentifier)
+	if err != nil {
+		err := fmt.Errorf("cannot read IPAM pool allocation: %w", err)
+		if e, ok := err.(storage.Temporary); ok && e.Temporary() {
+			return net.IPNet{}, overlappingrangeallocations, skipOverlappingRangeUpdate, RetriableError{err}
+		}
+		return net.IPNet{}, overlappingrangeallocations, skipOverlappingRangeUpdate, err
+	}
+
+	var (
+		reservelist        = append(pool.Allocations(), overlappingrangeallocations...)
+		updatedreservelist []whereaboutstypes.IPReservation
+	)
+
+	switch mode {
+	case whereaboutstypes.Allocate:
+		newip, updatedreservelist, err = allocate.AssignIP(ipRange, reservelist, ipam.ContainerID, ipamConf.GetPodRef(), ipam.IfName)
+		if err != nil {
+			return net.IPNet{}, overlappingrangeallocations, skipOverlappingRangeUpdate, fmt.Errorf("cannot assign IP: %w", err)
+		}
+
+		// Now check if this is allocated overlappingrange wide
+		// When it's allocated overlappingrange wide, we add it to a local reserved list
+		// And we try again.
+		if ipamConf.OverlappingRanges {
+			overlappingRangeIPReservation, err := overlappingrangestore.GetOverlappingRangeIPReservation(ctx, newip.IP,
+				ipamConf.GetPodRef(), ipamConf.NetworkName)
+			if err != nil {
+				return newip, overlappingrangeallocations, skipOverlappingRangeUpdate, fmt.Errorf("cannot get cluster wide IP allocation: %w", err)
+			}
+
+			if overlappingRangeIPReservation != nil {
+				if overlappingRangeIPReservation.Spec.PodRef != ipamConf.GetPodRef() {
+					logging.Debugf("Continuing loop, IP is already allocated (possibly from another range): %v", newip)
+					// We create "dummy" records here for evaluation, but, we need to filter those out later.
+					overlappingrangeallocations = append(overlappingrangeallocations, whereaboutstypes.IPReservation{IP: newip.IP, IsAllocated: true})
+					return newip, overlappingrangeallocations, skipOverlappingRangeUpdate, RetriableError{fmt.Errorf("IP is already allocated (possibly from another range): %v", newip)}
+				}
+
+				skipOverlappingRangeUpdate = true
+			}
+		}
+
+	case whereaboutstypes.Deallocate:
+		var ipforoverlappingrangeupdate net.IP
+		updatedreservelist, ipforoverlappingrangeupdate = allocate.DeallocateIP(reservelist, ipam.ContainerID, ipam.IfName)
+		if ipforoverlappingrangeupdate == nil {
+			// Do not fail if allocation was not found.
+			logging.Debugf("Failed to find allocation for container ID: %s", ipam.ContainerID)
+			return net.IPNet{}, overlappingrangeallocations, skipOverlappingRangeUpdate, nil
+		}
+	}
+
+	// Clean out any dummy records from the reservelist...
+	var usereservelist []whereaboutstypes.IPReservation
+	for _, rl := range updatedreservelist {
+		if !rl.IsAllocated {
+			usereservelist = append(usereservelist, rl)
+		}
+	}
+
+	// Manual race condition testing
+	if ipamConf.SleepForRace > 0 {
+		time.Sleep(time.Duration(ipamConf.SleepForRace) * time.Second)
+	}
+
+	err = pool.Update(ctx, usereservelist)
+	if err != nil {
+		err = fmt.Errorf("cannot update IPAM pool allocations: %w", err)
+		if e, ok := err.(storage.Temporary); ok && e.Temporary() {
+			return net.IPNet{}, overlappingrangeallocations, skipOverlappingRangeUpdate, RetriableError{fmt.Errorf("cannot update IPAM pool allocations: %w", err)}
+		}
+		return net.IPNet{}, overlappingrangeallocations, skipOverlappingRangeUpdate, err
+	}
+
+	return newip, overlappingrangeallocations, skipOverlappingRangeUpdate, nil
+}
+
+func allocateDeallocateFromRange(ctx context.Context, ipam *KubernetesIPAM, ipamConf whereaboutstypes.IPAMConfig, mode whereaboutstypes.OperationType, ipRange whereaboutstypes.RangeConfiguration) (net.IPNet, error) {
+	overlappingrangestore, err := ipam.GetOverlappingRangeStore()
+	if err != nil {
+		return net.IPNet{}, fmt.Errorf("cannot get OverlappingRangeStore: %w", err)
+	}
+
+	requestCtx, cancelFn := context.WithTimeout(ctx, storage.RequestTimeout)
+	defer cancelFn()
+
+	var (
+		newip net.IPNet
+
+		// handle the ip add/del until successful
+		overlappingrangeallocations []whereaboutstypes.IPReservation
+
+		skipOverlappingRangeUpdate bool
+	)
+
+	for j := 0; j < storage.DatastoreRetries; j++ {
+		select {
+		case <-ctx.Done():
+			return net.IPNet{}, ctx.Err()
+		default:
+			// retry the IPAM loop if the context has not been cancelled
+		}
+
+		newip, overlappingrangeallocations, skipOverlappingRangeUpdate, err = retriableAllocateDeallocateFromRange(requestCtx, ipam, ipamConf, overlappingrangestore, overlappingrangeallocations, mode, ipRange)
+		if err != nil {
+			if goerr.Is(err, RetriableError{err}) {
+				logging.Debugf("cannot allocate IP (attempt: %d): %v", j, err)
+				continue
+			}
+			return net.IPNet{}, fmt.Errorf("cannot allocate IP: %w", err)
+		}
+		break
+	}
+
+	if err != nil {
+		return net.IPNet{}, fmt.Errorf("cannot allocate IP: %w", err)
+	}
+
+	if ipamConf.OverlappingRanges && !skipOverlappingRangeUpdate && newip.IP != nil {
+		err := overlappingrangestore.UpdateOverlappingRangeAllocation(requestCtx, mode, newip.IP,
+			ipamConf.GetPodRef(), ipam.IfName, ipamConf.NetworkName)
+		if err != nil {
+			return net.IPNet{}, fmt.Errorf("cannot update overlapping range allocation: %w", err)
+		}
+	}
+
+	return newip, nil
+}
+
 // IPManagementKubernetesUpdate manages k8s updates
 func IPManagementKubernetesUpdate(ctx context.Context, mode whereaboutstypes.OperationType, ipam *KubernetesIPAM, ipamConf whereaboutstypes.IPAMConfig) ([]net.IPNet, error) {
 	logging.Debugf("IPManagement -- mode: %d / containerID: %q / podRef: %q / ifName: %q ", mode, ipam.ContainerID, ipamConf.GetPodRef(), ipam.IfName)
 
-	var newips []net.IPNet
-	var newip net.IPNet
 	// Skip invalid modes
 	switch mode {
 	case whereaboutstypes.Allocate, whereaboutstypes.Deallocate:
 	default:
-		return newips, fmt.Errorf("got an unknown mode passed to IPManagement: %v", mode)
+		return nil, fmt.Errorf("got an unknown mode passed to IPManagement: %v", mode)
 	}
 
 	requestCtx, requestCancel := context.WithTimeout(ctx, storage.RequestTimeout)
@@ -561,178 +760,27 @@ func IPManagementKubernetesUpdate(ctx context.Context, mode whereaboutstypes.Ope
 	// Check our connectivity first
 	if err := ipam.Status(requestCtx); err != nil {
 		logging.Errorf("IPAM connectivity error: %v", err)
-		return newips, err
+		return nil, err
 	}
 
-	var err error
+	newips := make([]net.IPNet, 0, len(ipamConf.IPRanges))
 
-RANGESLOOP:
 	for _, ipRange := range ipamConf.IPRanges {
-		var (
-			// handle the ip add/del until successful
-			overlappingrangeallocations []whereaboutstypes.IPReservation
-			ipforoverlappingrangeupdate net.IP
-
-			overlappingrangestore storage.OverlappingRangeStore
-			pool                  storage.IPPool
-
-			skipOverlappingRangeUpdate bool
-		)
-
-	RETRYLOOP:
-		for j := 0; j < storage.DatastoreRetries; j++ {
-			select {
-			case <-ctx.Done():
-				break RETRYLOOP
-			default:
-				// retry the IPAM loop if the context has not been cancelled
+		newIP, err := allocateDeallocateFromRange(ctx, ipam, ipamConf, mode, ipRange)
+		if err != nil {
+			ok := goerr.As(err, new(allocate.AssignmentError))
+			err := fmt.Errorf("cannot allocate IP from %v pool: %w", ipRange, err)
+			if !ok || (ok && !ipamConf.SingleIP) {
+				logging.Errorf(err.Error())
+				return nil, err
 			}
 
-			overlappingrangestore, err = ipam.GetOverlappingRangeStore()
-			if err != nil {
-				logging.Errorf("IPAM error getting OverlappingRangeStore: %v", err)
-				return newips, err
-			}
-			poolIdentifier := PoolIdentifier{IpRange: ipRange.Range, NetworkName: ipamConf.NetworkName}
-			if ipamConf.NodeSliceSize != "" {
-				hostname, err := getNodeName(ipam)
-				if err != nil {
-					logging.Errorf("Failed to get node hostname: %v", err)
-					return newips, err
-				}
-				poolIdentifier.NodeName = hostname
-				nodeSliceRange, err := GetNodeSlicePoolRange(ctx, ipam, hostname)
-				if err != nil {
-					return newips, err
-				}
-				_, ipNet, err := net.ParseCIDR(nodeSliceRange)
-				if err != nil {
-					logging.Errorf("Error parsing node slice cidr to net.IPNet: %v", err)
-					return newips, err
-				}
-				poolIdentifier.IpRange = nodeSliceRange
-				pool := whereaboutstypes.Pool{
-					IPNet:                   *ipNet,
-					IncludeNetworkAddress:   ipRange.IncludeNetworkAddress,
-					IncludeBroadcastAddress: ipRange.IncludeBroadcastAddress,
-				}
-				rangeStart, err := iphelpers.FirstUsableIP(pool)
-				if err != nil {
-					logging.Errorf("Error parsing node slice cidr to range start: %v", err)
-					return newips, err
-				}
-				rangeEnd, err := iphelpers.LastUsableIP(pool)
-				if err != nil {
-					logging.Errorf("Error parsing node slice cidr to range start: %v", err)
-					return newips, err
-				}
-				ipRange = whereaboutstypes.RangeConfiguration{
-					Range: ipRange.Range,
-
-					RangeStart:            rangeStart,
-					IncludeNetworkAddress: ipRange.IncludeNetworkAddress,
-
-					RangeEnd:                rangeEnd,
-					IncludeBroadcastAddress: ipRange.IncludeBroadcastAddress,
-				}
-			}
-			logging.Debugf("using pool identifier: %v", poolIdentifier)
-			pool, err = ipam.GetIPPool(requestCtx, poolIdentifier)
-			if err != nil {
-				logging.Errorf("IPAM error reading pool allocations (attempt: %d): %v", j, err)
-				if e, ok := err.(storage.Temporary); ok && e.Temporary() {
-					continue
-				}
-				return newips, err
-			}
-
-			reservelist := pool.Allocations()
-			reservelist = append(reservelist, overlappingrangeallocations...)
-			var updatedreservelist []whereaboutstypes.IPReservation
-			switch mode {
-			case whereaboutstypes.Allocate:
-				newip, updatedreservelist, err = allocate.AssignIP(ipRange, reservelist, ipam.ContainerID, ipamConf.GetPodRef(), ipam.IfName)
-				if err != nil {
-					ok := goerr.As(err, new(allocate.AssignmentError))
-					if !ok || (ok && !ipamConf.SingleIP) {
-						_ = logging.Errorf("Error assigning IP: %v", err)
-						return newips, err
-					}
-
-					logging.Debugf("Cannot assign addr from %v pool: %v", ipRange, err)
-					continue RANGESLOOP
-				}
-				// Now check if this is allocated overlappingrange wide
-				// When it's allocated overlappingrange wide, we add it to a local reserved list
-				// And we try again.
-				if ipamConf.OverlappingRanges {
-					overlappingRangeIPReservation, err := overlappingrangestore.GetOverlappingRangeIPReservation(requestCtx, newip.IP,
-						ipamConf.GetPodRef(), ipamConf.NetworkName)
-					if err != nil {
-						logging.Errorf("Error getting cluster wide IP allocation: %v", err)
-						return newips, err
-					}
-
-					if overlappingRangeIPReservation != nil {
-						if overlappingRangeIPReservation.Spec.PodRef != ipamConf.GetPodRef() {
-							logging.Debugf("Continuing loop, IP is already allocated (possibly from another range): %v", newip)
-							// We create "dummy" records here for evaluation, but, we need to filter those out later.
-							overlappingrangeallocations = append(overlappingrangeallocations, whereaboutstypes.IPReservation{IP: newip.IP, IsAllocated: true})
-							continue
-						}
-
-						skipOverlappingRangeUpdate = true
-					}
-
-					ipforoverlappingrangeupdate = newip.IP
-				}
-
-			case whereaboutstypes.Deallocate:
-				updatedreservelist, ipforoverlappingrangeupdate = allocate.DeallocateIP(reservelist, ipam.ContainerID, ipam.IfName)
-				if ipforoverlappingrangeupdate == nil {
-					// Do not fail if allocation was not found.
-					logging.Debugf("Failed to find allocation for container ID: %s", ipam.ContainerID)
-					continue RANGESLOOP
-				}
-			}
-
-			// Clean out any dummy records from the reservelist...
-			var usereservelist []whereaboutstypes.IPReservation
-			for _, rl := range updatedreservelist {
-				if !rl.IsAllocated {
-					usereservelist = append(usereservelist, rl)
-				}
-			}
-
-			// Manual race condition testing
-			if ipamConf.SleepForRace > 0 {
-				time.Sleep(time.Duration(ipamConf.SleepForRace) * time.Second)
-			}
-
-			err = pool.Update(requestCtx, usereservelist)
-			if err != nil {
-				logging.Errorf("IPAM error updating pool (attempt: %d): %v", j, err)
-				if e, ok := err.(storage.Temporary); ok && e.Temporary() {
-					continue
-				}
-				break RETRYLOOP
-			}
-			break RETRYLOOP
+			logging.Debugf(err.Error())
+			continue
 		}
 
-		if ipamConf.OverlappingRanges {
-			if !skipOverlappingRangeUpdate {
-				err = overlappingrangestore.UpdateOverlappingRangeAllocation(requestCtx, mode, ipforoverlappingrangeupdate,
-					ipamConf.GetPodRef(), ipam.IfName, ipamConf.NetworkName)
-				if err != nil {
-					logging.Errorf("Error performing UpdateOverlappingRangeAllocation: %v", err)
-					return newips, err
-				}
-			}
-		}
-
-		if mode == whereaboutstypes.Allocate {
-			newips = append(newips, newip)
+		if mode == whereaboutstypes.Allocate && newIP.IP != nil {
+			newips = append(newips, newIP)
 
 			if ipamConf.SingleIP && len(newips) > 0 {
 				logging.Debugf("Single IP is allocated from %v pool, stop iterating", ipRange)
@@ -740,7 +788,8 @@ RANGESLOOP:
 			}
 		}
 	}
-	return newips, err
+
+	return newips, nil
 }
 
 func wbNamespaceFromCtx(ctx *clientcmdapi.Context) string {
