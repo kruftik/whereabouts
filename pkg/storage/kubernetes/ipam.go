@@ -719,7 +719,7 @@ func allocateDeallocateFromRange(ctx context.Context, ipam *KubernetesIPAM, ipam
 
 		newip, overlappingrangeallocations, skipOverlappingRangeUpdate, err = retriableAllocateDeallocateFromRange(requestCtx, ipam, ipamConf, overlappingrangestore, overlappingrangeallocations, mode, ipRange)
 		if err != nil {
-			if goerr.Is(err, RetriableError{err}) {
+			if goerr.As(err, new(RetriableError)) {
 				logging.Debugf("cannot allocate IP (attempt: %d): %v", j, err)
 				continue
 			}
