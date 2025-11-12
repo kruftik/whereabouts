@@ -603,6 +603,9 @@ func retriableAllocateDeallocateFromRange(ctx context.Context, ipam *KubernetesI
 		err error
 	)
 
+	ctx, cancelFn := context.WithTimeout(ctx, storage.RequestTimeout)
+	defer cancelFn()
+
 	poolIdentifier := PoolIdentifier{IpRange: ipRange.Range, NetworkName: ipamConf.NetworkName}
 	if ipamConf.NodeSliceSize != "" {
 		ipRange, poolIdentifier, err = getNodeSlicedRangeAndPoolConfiguration(ctx, ipam, ipRange, poolIdentifier)
@@ -665,6 +668,9 @@ func retriableAllocateDeallocateFromRange(ctx context.Context, ipam *KubernetesI
 			logging.Debugf("Failed to find allocation for container ID: %s", ipam.ContainerID)
 			return net.IPNet{}, overlappingrangeallocations, skipOverlappingRangeUpdate, nil
 		}
+		newip = net.IPNet{
+			IP: ipforoverlappingrangeupdate,
+		}
 	}
 
 	// Clean out any dummy records from the reservelist...
@@ -693,15 +699,14 @@ func retriableAllocateDeallocateFromRange(ctx context.Context, ipam *KubernetesI
 	return newip, overlappingrangeallocations, skipOverlappingRangeUpdate, nil
 }
 
-func allocateDeallocateFromRange(ctx context.Context, ipam *KubernetesIPAM, ipamConf whereaboutstypes.IPAMConfig, mode whereaboutstypes.OperationType, ipRange whereaboutstypes.RangeConfiguration) (net.IPNet, error) {
-	overlappingrangestore, err := ipam.GetOverlappingRangeStore()
-	if err != nil {
-		return net.IPNet{}, fmt.Errorf("cannot get OverlappingRangeStore: %w", err)
-	}
-
-	requestCtx, cancelFn := context.WithTimeout(ctx, storage.RequestTimeout)
-	defer cancelFn()
-
+func allocateDeallocateFromRange(
+	ctx context.Context,
+	ipam *KubernetesIPAM,
+	ipamConf whereaboutstypes.IPAMConfig,
+	overlappingrangestore storage.OverlappingRangeStore,
+	mode whereaboutstypes.OperationType,
+	ipRange whereaboutstypes.RangeConfiguration,
+) (net.IPNet, error) {
 	var (
 		newip net.IPNet
 
@@ -709,6 +714,8 @@ func allocateDeallocateFromRange(ctx context.Context, ipam *KubernetesIPAM, ipam
 		overlappingrangeallocations []whereaboutstypes.IPReservation
 
 		skipOverlappingRangeUpdate bool
+
+		err error
 	)
 
 	for j := 0; j < storage.DatastoreRetries; j++ {
@@ -719,7 +726,7 @@ func allocateDeallocateFromRange(ctx context.Context, ipam *KubernetesIPAM, ipam
 			// retry the IPAM loop if the context has not been cancelled
 		}
 
-		newip, overlappingrangeallocations, skipOverlappingRangeUpdate, err = retriableAllocateDeallocateFromRange(requestCtx, ipam, ipamConf, overlappingrangestore, overlappingrangeallocations, mode, ipRange)
+		newip, overlappingrangeallocations, skipOverlappingRangeUpdate, err = retriableAllocateDeallocateFromRange(ctx, ipam, ipamConf, overlappingrangestore, overlappingrangeallocations, mode, ipRange)
 		if err != nil {
 			if goerr.As(err, new(RetriableError)) {
 				logging.Debugf("cannot allocate IP (attempt: %d): %v", j, err)
@@ -733,6 +740,9 @@ func allocateDeallocateFromRange(ctx context.Context, ipam *KubernetesIPAM, ipam
 	if err != nil {
 		return net.IPNet{}, fmt.Errorf("cannot allocate IP: %w", err)
 	}
+
+	requestCtx, cancelFn := context.WithTimeout(ctx, storage.RequestTimeout)
+	defer cancelFn()
 
 	if ipamConf.OverlappingRanges && !skipOverlappingRangeUpdate {
 		err := overlappingrangestore.UpdateOverlappingRangeAllocation(requestCtx, mode, newip.IP,
@@ -761,23 +771,31 @@ func IPManagementKubernetesUpdate(ctx context.Context, mode whereaboutstypes.Ope
 
 	// Check our connectivity first
 	if err := ipam.Status(requestCtx); err != nil {
-		logging.Errorf("IPAM connectivity error: %v", err)
+		err := fmt.Errorf("IPAM connectivity error: %w", err)
+		logging.Errorf("%s", err.Error())
+		return nil, err
+	}
+
+	overlappingrangestore, err := ipam.GetOverlappingRangeStore()
+	if err != nil {
+		err := fmt.Errorf("cannot get OverlappingRangeStore: %w", err)
+		logging.Errorf("%s", err.Error())
 		return nil, err
 	}
 
 	newips := make([]net.IPNet, 0, len(ipamConf.IPRanges))
 
 	for _, ipRange := range ipamConf.IPRanges {
-		newIP, err := allocateDeallocateFromRange(ctx, ipam, ipamConf, mode, ipRange)
+		newIP, err := allocateDeallocateFromRange(ctx, ipam, ipamConf, overlappingrangestore, mode, ipRange)
 		if err != nil {
 			ok := goerr.As(err, new(allocate.AssignmentError))
 			err := fmt.Errorf("cannot allocate IP from %v pool: %w", ipRange, err)
 			if !ok || (ok && !ipamConf.SingleIP) {
-				logging.Errorf(err.Error())
+				logging.Errorf("%s", err.Error())
 				return nil, err
 			}
 
-			logging.Debugf(err.Error())
+			logging.Debugf("%s", err.Error())
 			continue
 		}
 
