@@ -58,7 +58,9 @@ const (
 	noResyncPeriod                   = 0
 )
 
-type garbageCollector func(ctx context.Context, mode types.OperationType, ipamConf types.IPAMConfig, client *wbclient.KubernetesIPAM) ([]net.IPNet, error)
+type deallocator interface {
+	Deallocate(ctx context.Context, ipamConf types.IPAMConfig, poolNS, podRef, containerID, ifName string) error
+}
 
 type PodController struct {
 	k8sClient               kubernetes.Interface
@@ -76,12 +78,12 @@ type PodController struct {
 	recorder                record.EventRecorder
 	workqueue               workqueue.TypedRateLimitingInterface[*v1.Pod]
 	mountPath               string
-	cleanupFunc             garbageCollector
+	deallocator             deallocator
 }
 
 // NewPodController ...
 func NewPodController(k8sCoreClient kubernetes.Interface, wbClient wbclientset.Interface, k8sCoreInformerFactory v1coreinformerfactory.SharedInformerFactory, wbSharedInformerFactory wbinformers.SharedInformerFactory, netAttachDefInformerFactory nadinformers.SharedInformerFactory, broadcaster record.EventBroadcaster, recorder record.EventRecorder) *PodController {
-	return newPodController(k8sCoreClient, wbClient, k8sCoreInformerFactory, wbSharedInformerFactory, netAttachDefInformerFactory, broadcaster, recorder, wbclient.IPManagement)
+	return newPodController(k8sCoreClient, wbClient, k8sCoreInformerFactory, wbSharedInformerFactory, netAttachDefInformerFactory, broadcaster, recorder, wbclient.NewIPAMService(wbclient.NewKubernetesClient(wbClient, k8sCoreClient)))
 }
 
 // PodInformerFactory is a wrapper around NewSharedInformerFactoryWithOptions. Before returning the informer, it will
@@ -100,7 +102,7 @@ func PodInformerFactory(k8sClientSet kubernetes.Interface) (v1coreinformerfactor
 			})), nil
 }
 
-func newPodController(k8sCoreClient kubernetes.Interface, wbClient wbclientset.Interface, k8sCoreInformerFactory v1coreinformerfactory.SharedInformerFactory, wbSharedInformerFactory wbinformers.SharedInformerFactory, netAttachDefInformerFactory nadinformers.SharedInformerFactory, broadcaster record.EventBroadcaster, recorder record.EventRecorder, cleanupFunc garbageCollector) *PodController {
+func newPodController(k8sCoreClient kubernetes.Interface, wbClient wbclientset.Interface, k8sCoreInformerFactory v1coreinformerfactory.SharedInformerFactory, wbSharedInformerFactory wbinformers.SharedInformerFactory, netAttachDefInformerFactory nadinformers.SharedInformerFactory, broadcaster record.EventBroadcaster, recorder record.EventRecorder, deallocator deallocator) *PodController {
 	k8sPodFilteredInformer := k8sCoreInformerFactory.Core().V1().Pods()
 	ipPoolInformer := wbSharedInformerFactory.Whereabouts().V1alpha1().IPPools()
 	netAttachDefInformer := netAttachDefInformerFactory.K8sCniCncfIo().V1().NetworkAttachmentDefinitions()
@@ -134,7 +136,7 @@ func newPodController(k8sCoreClient kubernetes.Interface, wbClient wbclientset.I
 		ipPoolLister:            ipPoolInformer.Lister(),
 		netAttachDefLister:      netAttachDefInformer.Lister(),
 		workqueue:               queue,
-		cleanupFunc:             cleanupFunc,
+		deallocator:             deallocator,
 	}
 }
 
@@ -204,7 +206,7 @@ func (pc *PodController) garbageCollectPodIPs(pod *v1.Pod) error {
 			logging.Debugf("error while computing something: %v", err)
 			continue
 		} else if err != nil {
-			return fmt.Errorf("failed to create an IPAM configuration for the pod %s iface %s: %+v", podID(podNamespace, podName), ifaceStatus.Name, err)
+			return fmt.Errorf("failed to create an IPAMService configuration for the pod %s iface %s: %+v", podID(podNamespace, podName), ifaceStatus.Name, err)
 		}
 
 		var pools []*whereaboutsv1alpha1.IPPool
@@ -240,17 +242,18 @@ func (pc *PodController) garbageCollectPodIPs(pod *v1.Pod) error {
 
 					logging.Verbosef("stale allocation to cleanup: %+v", allocation)
 
-					client := *wbclient.NewKubernetesClient(pc.wbClient, pc.k8sClient)
-					k8sIPAM := &wbclient.KubernetesIPAM{
-						Config:      *ipamConfig,
-						ContainerID: allocation.ContainerID,
-						IfName:      allocation.IfName,
-						Namespace:   pool.Namespace,
-						Client:      client,
-					}
-
-					if _, err := pc.cleanupFunc(context.TODO(), types.Deallocate, *ipamConfig, k8sIPAM); err != nil {
-						logging.Errorf("failed to cleanup allocation: %v", err)
+					err := pc.deallocator.Deallocate(
+						context.TODO(),
+						*ipamConfig,
+						pool.Namespace,
+						ipamConfig.GetPodRef(),
+						allocation.ContainerID,
+						allocation.IfName,
+					)
+					if err != nil {
+						err := fmt.Errorf("failed to deallocate IPs of pod [%s/%s]: %v: %w", podName, podNamespace, allocation, err)
+						logging.Errorf("%s", err.Error())
+						return err
 					}
 					if err := pc.addressGarbageCollected(pod, nad.GetName(), pool.Spec.Range, allocationIndex); err != nil {
 						logging.Errorf("failed to issue event for successful IP address cleanup: %v", err)
