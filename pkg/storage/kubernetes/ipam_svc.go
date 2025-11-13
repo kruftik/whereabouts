@@ -23,12 +23,6 @@ type IPAMService struct {
 	client *Client
 }
 
-type ipamService interface {
-	Status(ctx context.Context) error
-	GetIPPool(ctx context.Context, pool PoolIdentifier) (storage.IPPool, error)
-	GetOverlappingRangeStore() (storage.OverlappingRangeStore, error)
-}
-
 func NewIPAMService(client *Client) IPAMService {
 	return IPAMService{
 		client: client,
