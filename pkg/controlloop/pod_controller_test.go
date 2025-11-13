@@ -295,7 +295,7 @@ func podReference(pod *v1.Pod) string {
 func dummyWhereaboutsConfig() string {
 	return `{
       "datastore": "kubernetes",
-      "kubernetes": {allocates addresses using range_end as an upper limit
+      "kubernetes": {
         "kubeconfig": "/etc/cni/net.d/whereabouts.d/whereabouts.kubeconfig"
       },
       "log_file": "/tmp/whereabouts.log",
