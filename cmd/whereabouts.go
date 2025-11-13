@@ -18,20 +18,6 @@ import (
 	"github.com/k8snetworkplumbingwg/whereabouts/pkg/version"
 )
 
-type IPAM interface {
-	Allocate(
-		ctx context.Context,
-		ipamConf types.IPAMConfig,
-		poolNS, podRef, containerID, ifName string,
-	) ([]net.IPNet, error)
-
-	Deallocate(
-		ctx context.Context,
-		ipamConf types.IPAMConfig,
-		poolNS, podRef, containerID, ifName string,
-	) error
-}
-
 func cmdAddFunc(args *skel.CmdArgs) error {
 	ipamConf, confVersion, err := config.LoadIPAMConfig(args.StdinData, args.Args)
 	if err != nil {
@@ -45,18 +31,8 @@ func cmdAddFunc(args *skel.CmdArgs) error {
 	}
 	defer func() { safeCloseKubernetesBackendConnection(ipam) }()
 
-	ipamSvc := kubernetes.NewIPAMService(&ipam.Client)
-
 	logging.Debugf("Beginning IPAMService for ContainerID: %q - podRef: %q - ifName: %q", args.ContainerID, ipamConf.GetPodRef(), args.IfName)
-	return cmdAdd(
-		confVersion,
-		ipamSvc,
-		ipam.Config,
-		ipam.Namespace,
-		ipam.Config.GetPodRef(),
-		ipam.ContainerID,
-		ipam.IfName,
-	)
+	return cmdAdd(ipam, confVersion)
 }
 
 func cmdDelFunc(args *skel.CmdArgs) error {
@@ -73,17 +49,8 @@ func cmdDelFunc(args *skel.CmdArgs) error {
 	}
 	defer func() { safeCloseKubernetesBackendConnection(ipam) }()
 
-	ipamSvc := kubernetes.NewIPAMService(&ipam.Client)
-
 	logging.Debugf("Beginning delete for ContainerID: %q - podRef: %q - ifName: %q", args.ContainerID, ipamConf.GetPodRef(), args.IfName)
-	return cmdDel(
-		ipamSvc,
-		ipam.Config,
-		ipam.Namespace,
-		ipam.Config.GetPodRef(),
-		ipam.ContainerID,
-		ipam.IfName,
-	)
+	return cmdDel(ipam)
 }
 
 func main() {
@@ -107,23 +74,18 @@ func cmdCheck(args *skel.CmdArgs) error {
 	return fmt.Errorf("CNI CHECK method is not implemented")
 }
 
-func cmdAdd(
-	cniVersion string,
-	ipam IPAM,
-	ipamConf types.IPAMConfig,
-	poolNS, podRef, containerID, ifName string,
-) error {
+func cmdAdd(ipam *kubernetes.KubernetesIPAM, cniVersion string) error {
 	// Initialize our result, and assign DNS & routing.
 	result := &current.Result{}
-	result.DNS = ipamConf.DNS
-	result.Routes = ipamConf.Routes
+	result.DNS = ipam.Config.DNS
+	result.Routes = ipam.Config.Routes
 
 	var newips []net.IPNet
 
 	ctx, cancel := context.WithTimeout(context.Background(), types.AddTimeLimit)
 	defer cancel()
 
-	newips, err := ipam.Allocate(ctx, ipamConf, poolNS, podRef, containerID, ifName)
+	newips, err := kubernetes.NewIPAMService(&ipam.Client).Allocate(ctx, ipam.Config, ipam.Namespace, ipam.Config.GetPodRef(), ipam.ContainerID, ipam.IfName)
 	if err != nil {
 		logging.Errorf("Error at storage engine: %s", err)
 		return fmt.Errorf("error at storage engine: %w", err)
@@ -132,11 +94,12 @@ func cmdAdd(
 	for _, newip := range newips {
 		result.IPs = append(result.IPs, &current.IPConfig{
 			Address: newip,
-			Gateway: ipamConf.Gateway})
+			Gateway: ipam.Config.Gateway,
+		})
 	}
 
 	// Assign all the static IP elements.
-	for _, v := range ipamConf.Addresses {
+	for _, v := range ipam.Config.Addresses {
 		result.IPs = append(result.IPs, &current.IPConfig{
 			Address: v.Address,
 			Gateway: v.Gateway})
@@ -145,13 +108,9 @@ func cmdAdd(
 	return cnitypes.PrintResult(result, cniVersion)
 }
 
-func cmdDel(
-	ipam IPAM,
-	ipamConf types.IPAMConfig,
-	poolNS, podRef, containerID, ifName string,
-) error {
+func cmdDel(ipam *kubernetes.KubernetesIPAM) error {
 	ctx, cancel := context.WithTimeout(context.Background(), types.DelTimeLimit)
 	defer cancel()
 
-	return ipam.Deallocate(ctx, ipamConf, poolNS, podRef, containerID, ifName)
+	return kubernetes.NewIPAMService(&ipam.Client).Deallocate(ctx, ipam.Config, ipam.Namespace, ipam.Config.GetPodRef(), ipam.ContainerID, ipam.IfName)
 }
