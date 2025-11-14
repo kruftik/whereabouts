@@ -3,13 +3,11 @@ package kubernetes
 import (
 	"context"
 	"encoding/json"
-	goerr "errors"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -23,7 +21,6 @@ import (
 
 	"gomodules.xyz/jsonpatch/v2"
 
-	"github.com/k8snetworkplumbingwg/whereabouts/pkg/allocate"
 	whereaboutsv1alpha1 "github.com/k8snetworkplumbingwg/whereabouts/pkg/api/whereabouts.cni.cncf.io/v1alpha1"
 	wbclient "github.com/k8snetworkplumbingwg/whereabouts/pkg/generated/clientset/versioned"
 	"github.com/k8snetworkplumbingwg/whereabouts/pkg/iphelpers"
@@ -456,70 +453,8 @@ func newLeaderElector(ctx context.Context, clientset kubernetes.Interface, names
 	return le, leaderOK, deposed
 }
 
-// IPManagement manages ip allocation and deallocation from a storage perspective
-func IPManagement(ctx context.Context, mode whereaboutstypes.OperationType, ipamConf whereaboutstypes.IPAMConfig, client *KubernetesIPAM) ([]net.IPNet, error) {
-	var newips []net.IPNet
-
-	if ipamConf.PodName == "" {
-		return newips, fmt.Errorf("IPAM client initialization error: no pod name")
-	}
-
-	// setup leader election
-	le, leader, deposed := newLeaderElector(ctx, client.clientSet, client.Namespace, client)
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	stopM := make(chan struct{})
-	result := make(chan error, 2)
-
-	var err error
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-ctx.Done():
-				err = fmt.Errorf("time limit exceeded while waiting to become leader")
-				stopM <- struct{}{}
-				return
-			case <-leader:
-				logging.Debugf("Elected as leader, do processing")
-				newips, err = IPManagementKubernetesUpdate(ctx, mode, client, ipamConf)
-				stopM <- struct{}{}
-				return
-			case <-deposed:
-				logging.Debugf("Deposed as leader, shutting down")
-				result <- nil
-				return
-			}
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		res := make(chan error)
-		leCtx, leCancel := context.WithCancel(context.Background())
-
-		go func() {
-			logging.Debugf("Started leader election")
-			le.Run(leCtx)
-			logging.Debugf("Finished leader election")
-			res <- nil
-		}()
-
-		// wait for stop which tells us when IP allocation occurred or context deadline exceeded
-		<-stopM
-		// leCancel fn(leCtx)
-		leCancel()
-		result <- (<-res)
-	}()
-	wg.Wait()
-	close(stopM)
-	logging.Debugf("IPManagement: %v, %v", newips, err)
-	return newips, err
-}
-
 func GetNodeSlicePoolRange(ctx context.Context, ipam *KubernetesIPAM, nodeName string) (string, error) {
-	logging.Debugf("ipam namespace is %v", ipam.Namespace)
+	logging.Debugf("client namespace is %v", ipam.Namespace)
 	nodeSlice, err := ipam.client.WhereaboutsV1alpha1().NodeSlicePools(ipam.Namespace).Get(ctx, getNodeSliceName(ipam), metav1.GetOptions{})
 	if err != nil {
 		logging.Errorf("error getting node slice %s/%s %v", ipam.Namespace, getNodeSliceName(ipam), err)
@@ -540,207 +475,6 @@ func getNodeSliceName(ipam *KubernetesIPAM) string {
 		return ipam.Config.Name
 	}
 	return ipam.Config.NetworkName
-}
-
-// IPManagementKubernetesUpdate manages k8s updates
-func IPManagementKubernetesUpdate(ctx context.Context, mode whereaboutstypes.OperationType, ipam *KubernetesIPAM, ipamConf whereaboutstypes.IPAMConfig) ([]net.IPNet, error) {
-	logging.Debugf("IPManagement -- mode: %d / containerID: %q / podRef: %q / ifName: %q ", mode, ipam.ContainerID, ipamConf.GetPodRef(), ipam.IfName)
-
-	var newips []net.IPNet
-	var newip net.IPNet
-	// Skip invalid modes
-	switch mode {
-	case whereaboutstypes.Allocate, whereaboutstypes.Deallocate:
-	default:
-		return newips, fmt.Errorf("got an unknown mode passed to IPManagement: %v", mode)
-	}
-
-	requestCtx, requestCancel := context.WithTimeout(ctx, storage.RequestTimeout)
-	defer requestCancel()
-
-	// Check our connectivity first
-	if err := ipam.Status(requestCtx); err != nil {
-		logging.Errorf("IPAM connectivity error: %v", err)
-		return newips, err
-	}
-
-	var err error
-
-RANGESLOOP:
-	for _, ipRange := range ipamConf.IPRanges {
-		var (
-			// handle the ip add/del until successful
-			overlappingrangeallocations []whereaboutstypes.IPReservation
-			ipforoverlappingrangeupdate net.IP
-
-			overlappingrangestore storage.OverlappingRangeStore
-			pool                  storage.IPPool
-
-			skipOverlappingRangeUpdate bool
-		)
-
-	RETRYLOOP:
-		for j := 0; j < storage.DatastoreRetries; j++ {
-			select {
-			case <-ctx.Done():
-				break RETRYLOOP
-			default:
-				// retry the IPAM loop if the context has not been cancelled
-			}
-
-			overlappingrangestore, err = ipam.GetOverlappingRangeStore()
-			if err != nil {
-				logging.Errorf("IPAM error getting OverlappingRangeStore: %v", err)
-				return newips, err
-			}
-			poolIdentifier := PoolIdentifier{IpRange: ipRange.Range, NetworkName: ipamConf.NetworkName}
-			if ipamConf.NodeSliceSize != "" {
-				hostname, err := getNodeName(ipam)
-				if err != nil {
-					logging.Errorf("Failed to get node hostname: %v", err)
-					return newips, err
-				}
-				poolIdentifier.NodeName = hostname
-				nodeSliceRange, err := GetNodeSlicePoolRange(ctx, ipam, hostname)
-				if err != nil {
-					return newips, err
-				}
-				_, ipNet, err := net.ParseCIDR(nodeSliceRange)
-				if err != nil {
-					logging.Errorf("Error parsing node slice cidr to net.IPNet: %v", err)
-					return newips, err
-				}
-				poolIdentifier.IpRange = nodeSliceRange
-				pool := whereaboutstypes.Pool{
-					IPNet:                   *ipNet,
-					IncludeNetworkAddress:   ipRange.IncludeNetworkAddress,
-					IncludeBroadcastAddress: ipRange.IncludeBroadcastAddress,
-				}
-				rangeStart, err := iphelpers.FirstUsableIP(pool)
-				if err != nil {
-					logging.Errorf("Error parsing node slice cidr to range start: %v", err)
-					return newips, err
-				}
-				rangeEnd, err := iphelpers.LastUsableIP(pool)
-				if err != nil {
-					logging.Errorf("Error parsing node slice cidr to range start: %v", err)
-					return newips, err
-				}
-				ipRange = whereaboutstypes.RangeConfiguration{
-					Range: ipRange.Range,
-
-					RangeStart:            rangeStart,
-					IncludeNetworkAddress: ipRange.IncludeNetworkAddress,
-
-					RangeEnd:                rangeEnd,
-					IncludeBroadcastAddress: ipRange.IncludeBroadcastAddress,
-				}
-			}
-			logging.Debugf("using pool identifier: %v", poolIdentifier)
-			pool, err = ipam.GetIPPool(requestCtx, poolIdentifier)
-			if err != nil {
-				logging.Errorf("IPAM error reading pool allocations (attempt: %d): %v", j, err)
-				if e, ok := err.(storage.Temporary); ok && e.Temporary() {
-					continue
-				}
-				return newips, err
-			}
-
-			reservelist := pool.Allocations()
-			reservelist = append(reservelist, overlappingrangeallocations...)
-			var updatedreservelist []whereaboutstypes.IPReservation
-			switch mode {
-			case whereaboutstypes.Allocate:
-				newip, updatedreservelist, err = allocate.AssignIP(ipRange, reservelist, ipam.ContainerID, ipamConf.GetPodRef(), ipam.IfName)
-				if err != nil {
-					ok := goerr.As(err, new(allocate.AssignmentError))
-					if !ok || (ok && !ipamConf.SingleIP) {
-						_ = logging.Errorf("Error assigning IP: %v", err)
-						return newips, err
-					}
-
-					logging.Debugf("Cannot assign addr from %v pool: %v", ipRange, err)
-					continue RANGESLOOP
-				}
-				// Now check if this is allocated overlappingrange wide
-				// When it's allocated overlappingrange wide, we add it to a local reserved list
-				// And we try again.
-				if ipamConf.OverlappingRanges {
-					overlappingRangeIPReservation, err := overlappingrangestore.GetOverlappingRangeIPReservation(requestCtx, newip.IP,
-						ipamConf.GetPodRef(), ipamConf.NetworkName)
-					if err != nil {
-						logging.Errorf("Error getting cluster wide IP allocation: %v", err)
-						return newips, err
-					}
-
-					if overlappingRangeIPReservation != nil {
-						if overlappingRangeIPReservation.Spec.PodRef != ipamConf.GetPodRef() {
-							logging.Debugf("Continuing loop, IP is already allocated (possibly from another range): %v", newip)
-							// We create "dummy" records here for evaluation, but, we need to filter those out later.
-							overlappingrangeallocations = append(overlappingrangeallocations, whereaboutstypes.IPReservation{IP: newip.IP, IsAllocated: true})
-							continue
-						}
-
-						skipOverlappingRangeUpdate = true
-					}
-
-					ipforoverlappingrangeupdate = newip.IP
-				}
-
-			case whereaboutstypes.Deallocate:
-				updatedreservelist, ipforoverlappingrangeupdate = allocate.DeallocateIP(reservelist, ipam.ContainerID, ipam.IfName)
-				if ipforoverlappingrangeupdate == nil {
-					// Do not fail if allocation was not found.
-					logging.Debugf("Failed to find allocation for container ID: %s", ipam.ContainerID)
-					continue RANGESLOOP
-				}
-			}
-
-			// Clean out any dummy records from the reservelist...
-			var usereservelist []whereaboutstypes.IPReservation
-			for _, rl := range updatedreservelist {
-				if !rl.IsAllocated {
-					usereservelist = append(usereservelist, rl)
-				}
-			}
-
-			// Manual race condition testing
-			if ipamConf.SleepForRace > 0 {
-				time.Sleep(time.Duration(ipamConf.SleepForRace) * time.Second)
-			}
-
-			err = pool.Update(requestCtx, usereservelist)
-			if err != nil {
-				logging.Errorf("IPAM error updating pool (attempt: %d): %v", j, err)
-				if e, ok := err.(storage.Temporary); ok && e.Temporary() {
-					continue
-				}
-				break RETRYLOOP
-			}
-			break RETRYLOOP
-		}
-
-		if ipamConf.OverlappingRanges {
-			if !skipOverlappingRangeUpdate {
-				err = overlappingrangestore.UpdateOverlappingRangeAllocation(requestCtx, mode, ipforoverlappingrangeupdate,
-					ipamConf.GetPodRef(), ipam.IfName, ipamConf.NetworkName)
-				if err != nil {
-					logging.Errorf("Error performing UpdateOverlappingRangeAllocation: %v", err)
-					return newips, err
-				}
-			}
-		}
-
-		if mode == whereaboutstypes.Allocate {
-			newips = append(newips, newip)
-
-			if ipamConf.SingleIP && len(newips) > 0 {
-				logging.Debugf("Single IP is allocated from %v pool, stop iterating", ipRange)
-				break
-			}
-		}
-	}
-	return newips, err
 }
 
 func wbNamespaceFromCtx(ctx *clientcmdapi.Context) string {

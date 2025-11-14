@@ -5,9 +5,6 @@ package controlloop
 
 import (
 	"context"
-	"net"
-
-	kubeClient "github.com/k8snetworkplumbingwg/whereabouts/pkg/storage/kubernetes"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sclient "k8s.io/client-go/kubernetes"
@@ -22,6 +19,31 @@ import (
 	wbinformers "github.com/k8snetworkplumbingwg/whereabouts/pkg/generated/informers/externalversions"
 	"github.com/k8snetworkplumbingwg/whereabouts/pkg/types"
 )
+
+var (
+	_ deallocator = fakeDeallocator{}
+)
+
+type fakeDeallocator struct {
+	wbInformerFactory wbinformers.SharedInformerFactory
+	wbClient          wbclient.Interface
+}
+
+func (s fakeDeallocator) Deallocate(_ context.Context, _ types.IPAMConfig, _, podRef, _, _ string) error {
+	ipPools := castToIPPool(s.wbInformerFactory.Whereabouts().V1alpha1().IPPools().Informer().GetStore().List())
+	for _, pool := range ipPools {
+		for index, allocation := range pool.Spec.Allocations {
+			if allocation.PodRef == podRef {
+				delete(pool.Spec.Allocations, index)
+				_, err := s.wbClient.WhereaboutsV1alpha1().IPPools(ipPoolsNamespace()).Update(context.TODO(), &pool, metav1.UpdateOptions{})
+				if err != nil {
+					return err // no need to bother computing the allocated range
+				}
+			}
+		}
+	}
+	return nil
+}
 
 type dummyPodController struct {
 	*PodController
@@ -54,22 +76,11 @@ func newDummyPodController(
 		netAttachDefInformerFactory,
 		nil,
 		recorder,
-		func(_ context.Context, _ types.OperationType, ipamConfig types.IPAMConfig, client *kubeClient.KubernetesIPAM) ([]net.IPNet, error) {
-			ipPools := castToIPPool(wbInformerFactory.Whereabouts().V1alpha1().IPPools().Informer().GetStore().List())
-			for _, pool := range ipPools {
-				for index, allocation := range pool.Spec.Allocations {
-					if allocation.PodRef == ipamConfig.GetPodRef() {
-						delete(pool.Spec.Allocations, index)
-						_, err := wbClient.WhereaboutsV1alpha1().IPPools(ipPoolsNamespace()).Update(context.TODO(), &pool, metav1.UpdateOptions{})
-						if err != nil {
-							return []net.IPNet{}, err // no need to bother computing the allocated range
-						}
-					}
-				}
-			}
-
-			return []net.IPNet{}, nil
-		})
+		fakeDeallocator{
+			wbInformerFactory: wbInformerFactory,
+			wbClient:          wbClient,
+		},
+	)
 
 	alwaysReady := func() bool { return true }
 	podController.arePodsSynched = alwaysReady

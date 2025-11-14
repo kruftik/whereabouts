@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	nettypes "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
+
 	wbtestclient "github.com/k8snetworkplumbingwg/whereabouts/e2e/client"
 	"github.com/k8snetworkplumbingwg/whereabouts/e2e/entities"
 	"github.com/k8snetworkplumbingwg/whereabouts/e2e/poolconsistency"
@@ -104,7 +105,7 @@ var _ = Describe("Whereabouts node slice functionality", func() {
 			})
 
 			It("allocates a single pod within the correct IP range", func() {
-				By("checking pod IP is within whereabouts IPAM range")
+				By("checking pod IP is within whereabouts IPAMService range")
 				secondaryIfaceIPs, err := retrievers.SecondaryIfaceIPValue(pod, "net1")
 				Expect(err).NotTo(HaveOccurred())
 				Expect(secondaryIfaceIPs).NotTo(BeEmpty())
